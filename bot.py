@@ -7,18 +7,20 @@ from datetime import date
 import random
 import os
 from dotenv import load_dotenv
+import os
+import re
 
 timers_active_focus = {}
 timers_active_break = {}
 streak_counter = {}
-
+message_counter = {}
 
 
 test_guild = discord.Object(id=1468297881130897510)
 
 intents = discord.Intents.default()
 intents.message_content = True
-
+intents.members = True
 
 class BotCreate(commands.Bot):
 	def __init__(self):
@@ -27,7 +29,27 @@ class BotCreate(commands.Bot):
 bot = BotCreate()
 
 
-message_counter = {}
+@bot.event
+async def on_member_join(member: discord.Member):
+	
+	role_name = "Members"
+	
+	guild = member.guild
+	role = discord.utils.get(guild.roles, name=role_name)
+	
+	if role is None:
+		print(f"Role '{role_name}' not found in guild '{guild.name}'")
+		return
+	
+	try:
+		await member.add_roles(role)
+		await member.send(f"Welcome {member} you are now a Member of {guild.name}")
+		print(f"Assigned role '{role.name}' to {member.name}")
+	
+	except discord.Forbidden:
+		print(f"Failed to assign role '{role.name}' to {member.name}: Missing permissions")
+
+
 
 @bot.event
 async def on_ready():
@@ -60,6 +82,55 @@ async def on_message(message):
 @bot.tree.command(name="ping", description="check bot is working")
 async def ping(ctx: discord.Interaction):
 	await ctx.response.send_message("pong")
+
+MAX_DISCORD_CHARS = 2000
+
+
+def clean_ansi(text: str) -> str:
+    """Remove ANSI escape sequences from Ollama output."""
+    ansi_escape = re.compile(r'\x1B[@-_][0-?]*[ -/]*[@-~]')
+    return ansi_escape.sub('', text)
+
+@bot.tree.command(name="chat", description="Chat to FlowBot!")
+async def chat(ctx: discord.Interaction, *, message: str):
+    await ctx.response.defer()
+    process = None
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "ollama", "run", "mistral",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "OLLAMA_NO_SPINNER": "1", "OLLAMA_CLI_NO_SPINNER": "1"}
+        )
+
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(message.encode()),
+            timeout=60
+        )
+
+        response = clean_ansi(stdout.decode().strip())
+
+        
+        if not response and stderr and stderr.strip():
+            response = clean_ansi(stderr.decode().strip())
+
+    except asyncio.TimeoutError:
+        if process:
+            process.kill()
+        response = "⏱️ Model took too long to respond."
+
+    except Exception as e:
+        response = f"Error contacting Ollama: {e}"
+
+    response = response.strip() or "⚠️ Model returned no output."
+
+    
+    if len(response) > MAX_DISCORD_CHARS:
+        response = response[:MAX_DISCORD_CHARS - 3] + "..."
+
+    await ctx.followup.send(response)
 
 
 
@@ -108,10 +179,13 @@ async def focus_timer(ctx: discord.Interaction, minutes: int):
 async def focus(ctx: discord.Interaction, minutes: int):
 	user_id = ctx.user.id
 	if user_id in timers_active_focus:
-		await ctx.response.send_message("you already have a timer started if you want to stop it type /stop_focus")
+		await ctx.response.send_message("You already have a timer started if you want to stop it type /stop_focus")
 		return
 	if minutes <= 0:
 		await ctx.response.send_message("Please enter a positive value")
+		return
+	if minutes > 300:
+		await ctx.response.send_message("Focus time cannot exceed 300 minutes")
 		return
 	
 	await ctx.response.send_message("your focus timer has started")
@@ -139,6 +213,9 @@ async def rest(ctx: discord.Interaction, minutes: int):
 		return
 	if minutes <= 0:
 		await ctx.response.send_message("Please enter a positive value")
+		return
+	if minutes > 300:
+		await ctx.response.send_message("Break time cannot exceed 300 minutes")
 		return
 
 	timers_active_break[user_id] = asyncio.create_task(break_timer(ctx, minutes))
