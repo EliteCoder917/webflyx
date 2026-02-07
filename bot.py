@@ -1,4 +1,4 @@
-import discord 
+import discord
 from discord.ext import commands
 from discord import app_commands
 import asyncio
@@ -170,7 +170,6 @@ async def quote(ctx: discord.Interaction):
 
 load_dotenv()
 API_KEY = os.getenv('API_KEY')
-
 
 bot.run(API_KEY)
 
