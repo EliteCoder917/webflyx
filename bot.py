@@ -1,7 +1,6 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-import asyncio
 from datetime import datetime, timedelta
 from datetime import date
 import random
@@ -12,11 +11,19 @@ import asyncpg
 import signal
 import time
 import sys
+from typing import Dict, Set
+import asyncio
 
 timers_active_focus = {}
 timers_active_break = {}
 streak_counter = {}
 message_counter = {}
+chat_count = {}
+active_chat = set()
+pemium_users = {
+     989639440358072371: True,
+     931924643210752061: True
+}
 
 load_dotenv()
 API_KEY = os.getenv('API_KEY')
@@ -25,78 +32,121 @@ DATABASE_URL = os.getenv('DATABASE_URL')
 db_pool = None
 
 async def init_db():
-    global db_pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL)
-
-    
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
+	global db_pool
+	db_pool = await asyncpg.create_pool(DATABASE_URL)
+	
+	async with db_pool.acquire() as conn:
+		
+		await conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS streaks (
-                user_id BIGINT PRIMARY KEY,
-                day INT,
-                month INT,
-                year INT,
-                value INT,
+                user_id  BIGINT PRIMARY KEY,
+                day      INT,
+                month    INT,
+                year     INT,
+                value    INT,
                 reminded INT
             )
-        """)
-        await conn.execute("""
+            """
+        )
+		
+		await conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS messages (
                 user_id BIGINT PRIMARY KEY,
-                count INT
+                count   INT
             )
-        """)
+            """
+        )
+		
+		
+		await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chats (
+                user_id BIGINT PRIMARY KEY,
+                count   INT,
+                day     INT,
+                month   INT
+            )
+            """
+        )
 
 async def load_user_data():
-    global streak_counter, message_counter
-    async with db_pool.acquire() as conn:
-
-        rows = await conn.fetch("SELECT * FROM streaks")
-        for row in rows:
-            streak_counter[row['user_id']] = {
-                "day": row['day'],
-                "month": row['month'],
-                "year": row['year'],
-                "value": row['value'],
-                "reminded": row['reminded']
-            }
-
-        
-        rows = await conn.fetch("SELECT * FROM messages")
-        for row in rows:
-            message_counter[row['user_id']] = row['count']
-
-test_guild = discord.Object(id=1468297881130897510)
+	global streak_counter, message_counter
+	async with db_pool.acquire() as conn:
+		for row in await conn.fetch("SELECT * FROM streaks"):
+			streak_counter[row["user_id"]] = dict(row)
+			
+		for row in await conn.fetch("SELECT * FROM messages"):
+			message_counter[row["user_id"]] = row["count"]
+			
+		for row in await conn.fetch("SELECT * FROM chats"):
+			chat_count[row["user_id"]] = dict(row)
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.messages = True
 
-class BotCreate(commands.Bot):
-	def __init__(self):
-		super().__init__(command_prefix="/", intents=intents)
+class FlowBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="/", intents=intents)
 
-bot = BotCreate()
+bot = FlowBot()
 
 async def save_all_data():
     async with db_pool.acquire() as conn:
-        # Save messages
+
         for user_id, count in message_counter.items():
-            await conn.execute("""
-                INSERT INTO messages(user_id, count)
-                VALUES($1,$2)
-                ON CONFLICT(user_id) DO UPDATE
-                SET count=$2
-            """, user_id, count)
-        
-        # Save streaks
+            await conn.execute(
+                """
+                INSERT INTO messages (user_id, count)
+                VALUES ($1, $2)
+                ON CONFLICT (user_id) DO UPDATE
+                SET count = $2
+                """,
+                user_id,
+                count,
+            )
+
         for user_id, data in streak_counter.items():
-            await conn.execute("""
-                INSERT INTO streaks(user_id, day, month, year, value, reminded)
-                VALUES($1,$2,$3,$4,$5,$6)
-                ON CONFLICT(user_id) DO UPDATE
-                SET day=$2, month=$3, year=$4, value=$5, reminded=$6
-            """, user_id, data['day'], data['month'], data['year'], data['value'], data['reminded'])
+            await conn.execute(
+                """
+                INSERT INTO streaks (user_id, day, month, year, value, reminded)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (user_id) DO UPDATE
+                SET
+                    day = $2,
+                    month = $3,
+                    year = $4,
+                    value = $5,
+                    reminded = $6
+                """,
+                user_id,
+                data["day"],
+                data["month"],
+                data["year"],
+                data["value"],
+                data["reminded"],
+            )
+
+        for user_id, data in chat_count.items():
+            await conn.execute(
+                """
+                INSERT INTO chats (user_id, count, day, month)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (user_id) DO UPDATE
+                SET
+                    count = $2,
+                    day = $3,
+                    month = $4
+                """,
+                user_id,
+                data["count"],
+                data["day"],
+                data["month"],
+            )
+
 
 
 async def periodic_save():
@@ -105,40 +155,23 @@ async def periodic_save():
         try:
             await save_all_data()
         except Exception as e:
-            print(f"Error saving data periodically: {e}")
+            print("Periodic save error:", e)
         await asyncio.sleep(60)
 
 def shutdown_handler():
-    print("Bot shutting down…")
-
     async def shutdown():
-        print("Cancelling timers...")
         for task in timers_active_focus.values():
             task.cancel()
         for task in timers_active_break.values():
             task.cancel()
 
-        print("Saving data...")
         await save_all_data()
-
-        print("Closing database pool...")
         await db_pool.close()
-
-        print("Closing bot...")
         await bot.close()
 
-    loop = bot.loop
-
-    if loop.is_running():
-        fut = asyncio.run_coroutine_threadsafe(shutdown(), loop)
-        try:
-            fut.result(timeout=30)
-        except Exception as e:
-            print("Shutdown error:", e)
-    else:
-        asyncio.run(save_all_data())
-
-    print("Shutdown complete.")
+    loop = asyncio.get_running_loop()
+    future = asyncio.run_coroutine_threadsafe(shutdown(), loop)
+    future.result(timeout=5) 
     sys.exit(0)
 
 @bot.event
@@ -165,31 +198,21 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def on_ready():
-	global db_pool
-	print(f"logged in as {bot.user}")
-	await init_db()
-	await load_user_data()
-	try:
-		synced = await bot.tree.sync()
-		print(f"Synced {len(synced)} commands")
-	except Exception as e:
-		print(f"Failed to sync commands: {e}")
-	bot.loop.create_task(streak_checker())
-	bot.loop.create_task(periodic_save())
+    print(f"Logged in as {bot.user}")
+    await init_db()
+    await load_user_data()
+    await bot.tree.sync()
+    bot.loop.create_task(periodic_save())
+    bot.loop.create_task(streak_checker())
 
 
 @bot.event
-async def on_message(message):
-	if message.author == bot.user:
-		return
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
 
-	user_id = message.author.id
-
-	print(f"{message.author}:{message.content}")
-
-	await bot.process_commands(message)
-
-	message_counter[user_id] = message_counter.get(user_id, 0) + 1
+    message_counter[message.author.id] = message_counter.get(message.author.id, 0) + 1
+    await bot.process_commands(message)
 
 
 
@@ -201,160 +224,159 @@ MAX_DISCORD_CHARS = 2000
 
 
 def clean_ansi(text: str) -> str:
-    """Remove ANSI escape sequences from Ollama output."""
-    ansi_escape = re.compile(r'\x1B[@-_][0-?]*[ -/]*[@-~]')
-    return ansi_escape.sub('', text)
+    ansi = re.compile(r"\x1B[@-_][0-?]*[ -/]*[@-~]")
+    return ansi.sub("", text)
 
-@bot.tree.command(name="chat", description="Chat to FlowBot!")
+@bot.tree.command(name="chat")
 async def chat(ctx: discord.Interaction, *, message: str):
-    await ctx.response.defer()
-    process = None
+    user_id = ctx.user.id
+    today = datetime.now()
 
+    if user_id in active_chat:
+        await ctx.response.send_message("You are already chatting.")
+        return
 
-    prompt = (
-        f"You are FlowBot, a friendly and helpful Discord AI. "
-        f"Always refer to yourself as FlowBot. Respond to the user in a clear and concise way.\n\n"
-        f"User: {message}\nFlowBot:"
-    )
-
+    active_chat.add(user_id)
 
     try:
+        day = today.day
+        month = today.month
+
+        if (
+            user_id not in chat_count
+            or chat_count[user_id]["day"] != day
+            or chat_count[user_id]["month"] != month
+        ):
+            chat_count[user_id] = {"count": 0, "day": day, "month": month}
+            
+
+        if (user_id not in pemium_users) and chat_count[user_id]["count"] >= 3:
+            await ctx.response.send_message("Daily chat limit reached. Only selected useres can use the chat command more than 3 times a day. because the bot is still in its early stages and we want to ensure a good experience for everyone. Please try again tomorrow!")
+            return
+
+        await ctx.response.defer()
+
+        prompt = (
+            "You are FlowBot, a helpful Discord assistant.\n"
+            "You are apart of the FlowBot HQ server, where you assist users with their questions and provide helpful information.\n\n"
+            
+			f"{ctx.user.display_name}: {message}\nFlowBot:"
+        )
+
         process = await asyncio.create_subprocess_exec(
-            "ollama", "run", "mistral",
+            "ollama",
+            "run",
+            "mistral",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "OLLAMA_NO_SPINNER": "1", "OLLAMA_CLI_NO_SPINNER": "1"}
+            env={**os.environ, "OLLAMA_NO_SPINNER": "1"},
         )
 
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(prompt.encode()),
-            timeout=60
-        )
-
-        response = clean_ansi(stdout.decode().strip())
-
-        
-        if not response and stderr and stderr.strip():
-            response = clean_ansi(stderr.decode().strip())
-
-    except asyncio.TimeoutError:
-        if process:
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(prompt.encode()), timeout=45
+            )
+            response = clean_ansi(stdout.decode().strip())
+        except asyncio.TimeoutError:
             process.kill()
-        response = "⏱️ Model took too long to respond."
+            response = "⏱️ Model timed out."
 
-    except Exception as e:
-        response = f"Error contacting Ollama: {e}"
+        if not response:
+            response = "⚠️ No response from model."
 
-    response = response.strip() or "⚠️ Model returned no output."
+        response = response[: MAX_DISCORD_CHARS - 3]
 
-    
-    if len(response) > MAX_DISCORD_CHARS:
-        response = response[:MAX_DISCORD_CHARS - 3] + "..."
+        chat_count[user_id]["count"] += 1
+        await ctx.followup.send(response)
 
-    await ctx.followup.send(response)
+    finally:
+        active_chat.discard(user_id)
 
 
 
 async def focus_timer(ctx: discord.Interaction, minutes: int):
-	today = datetime.now()
-	day = today.day
-	month = today.month
-	year = today.year
-	user_id = ctx.user.id
+    await asyncio.sleep(minutes * 60)
+    user_id = ctx.user.id
 
-	await asyncio.sleep(minutes*60)
+    if user_id not in timers_active_focus:
+        return
+    if minutes == 1:
+        await ctx.followup.send(f"Focus session complete ({minutes} minute)")
+    else:
+        await ctx.followup.send(f"Focus session complete ({minutes} minutes)")
 
-	if user_id not in timers_active_focus:
-		return
-	if minutes == 1:
-		await ctx.followup.send("timer ended")
-		await ctx.followup.send(f"You have focused for {minutes} minute")
-	elif minutes >= 20:
-		await ctx.followup.send("timer ended")
-		await ctx.followup.send(f"You have focused for {minutes} minutes! Wow thats Exceptional 🔥🔥🔥")
-	elif minutes >= 10:
-		await ctx.followup.send("timer ended")
-		await ctx.followup.send(f"You have focused for {minutes} minutes! 🔥")
+    if minutes >= 10:
+        await ctx.followup.send("Your streak has been updated! Check it with /streak")
+        today = date.today()
 
-	if minutes >= 10:
-		if user_id not in streak_counter:
-			streak_counter[user_id] = {"day": day,"month": month,"year": year,"value": 1, "reminded": day}
-			await ctx.followup.send("you have started a streak")
-		else:
-			last_date = date(streak_counter[user_id]["year"], streak_counter[user_id]["month"], streak_counter[user_id]["day"])
-			today_date = date.today()
-			days_diff = (today_date - last_date).days
-			if days_diff == 0:
-				pass
-			elif days_diff >= 2:
-				await ctx.followup.send("You gone for to long your streak has been reset to 1")
-				streak_counter[user_id]["value"] = 1
-			else:
-				streak_counter[user_id]["value"] += 1
-				streak_counter[user_id]["reminded"] = day
-				await ctx.followup.send("You have added to you current streak!")
-			
-			streak_counter[user_id]["day"] = today_date.day
-			streak_counter[user_id]["month"] = today_date.month
-			streak_counter[user_id]["year"] = today_date.year
-			streak_counter[user_id]["reminded"] = today_date.day
+        if user_id not in streak_counter:
+            streak_counter[user_id] = {
+                "day": today.day,
+                "month": today.month,
+                "year": today.year,
+                "value": 1,
+                "reminded": today.day,
+            }
+        else:
+            last = date(
+                streak_counter[user_id]["year"],
+                streak_counter[user_id]["month"],
+                streak_counter[user_id]["day"],
+            )
+            diff = (today - last).days
+            if diff == 1:
+                streak_counter[user_id]["value"] += 1
+            elif diff >= 2:
+                streak_counter[user_id]["value"] = 1
 
-		data = streak_counter[user_id]
-		async with db_pool.acquire() as conn:
-			await conn.execute("""
-        	INSERT INTO streaks(user_id, day, month, year, value, reminded)
-        	VALUES($1,$2,$3,$4,$5,$6)
-        	ON CONFLICT(user_id) DO UPDATE
-        	SET day=$2, month=$3, year=$4, value=$5, reminded=$6
-    	""", user_id, data['day'], data['month'], data['year'], data['value'], data['reminded'])
+            streak_counter[user_id].update(
+                {
+                    "day": today.day,
+                    "month": today.month,
+                    "year": today.year,
+                    "reminded": today.day,
+                }
+            )
 
-	timers_active_focus.pop(user_id, None)
+    timers_active_focus.pop(user_id, None)
 
-@bot.tree.command(name="focus", description="start a focus timer")
+@bot.tree.command(name="focus")
 async def focus(ctx: discord.Interaction, minutes: int):
-	user_id = ctx.user.id
-	if user_id in timers_active_focus:
-		await ctx.response.send_message("You already have a timer started if you want to stop it type /stop_focus")
-		return
-	if minutes <= 0:
-		await ctx.response.send_message("Please enter a positive value")
-		return
-	if minutes > 300:
-		await ctx.response.send_message("Focus time cannot exceed 300 minutes")
-		return
-	
-	await ctx.response.send_message("your focus timer has started")
-	timers_active_focus[user_id] = asyncio.create_task(focus_timer(ctx, minutes))
+    user_id = ctx.user.id
+    if user_id in timers_active_focus:
+        await ctx.response.send_message("You already have an active focus timer.")
+        return
+    if minutes <= 0 or minutes > 300:
+        await ctx.response.send_message("Focus timer cannot exceed 300 minutes or be less than 1 minute.")
+        return
 
+    timers_active_focus[user_id] = asyncio.create_task(
+        focus_timer(ctx, minutes)
+    )
+    await ctx.response.send_message("Focus timer started.")
 
 async def break_timer(ctx: discord.Interaction, minutes: int):
-	user_id = ctx.user.id
-	
-	await asyncio.sleep(minutes*60)
-
-	if user_id not in timers_active_break:
-		return
-
-	await ctx.followup.send("your break timer has ended")
-
-	timers_active_break.pop(user_id, None)
+    await asyncio.sleep(minutes * 60)
+    if ctx.user.id in timers_active_break:
+        await ctx.followup.send("Break ended.")
+        timers_active_break.pop(ctx.user.id, None)
 
 
-@bot.tree.command(name="break", description="start a Break timer")
+@bot.tree.command(name="break")
 async def rest(ctx: discord.Interaction, minutes: int):
-	user_id = ctx.user.id
-	if user_id in timers_active_break:
-		await ctx.response.send_message("you already have a break timer started if you want to stop it type /stop_break")
-		return
-	if minutes <= 0:
-		await ctx.response.send_message("Please enter a positive value")
-		return
-	if minutes > 300:
-		await ctx.response.send_message("Break time cannot exceed 300 minutes")
-		return
+    user_id = ctx.user.id
+    if user_id in timers_active_focus:
+        await ctx.response.send_message("You already have an active break timer.")
+        return
+    if minutes <= 0 or minutes > 300:
+        await ctx.response.send_message("Break timer cannot exceed 300 minutes or be less than 1 minute.")
+        return
 
-	timers_active_break[user_id] = asyncio.create_task(break_timer(ctx, minutes))
+    timers_active_break[user_id] = asyncio.create_task(
+        break_timer(ctx, minutes)
+    )
+    await ctx.response.send_message("Break timer started.")
 
 
 @bot.tree.command(name="stop_focus", description="stop focus timer")
@@ -379,17 +401,22 @@ async def stop_break(ctx: discord.Interaction):
 
 @bot.tree.command(name="track", description="check how many messages you have sent in the server")
 async def track(ctx: discord.Interaction):
-	user_id = ctx.user.id
-	count = message_counter.get(user_id, 0)
-	await ctx.response.send_message(f"You have sent {count} messages")
+    user_id = ctx.user.id
+    count = message_counter.get(user_id, 0)
+    if count is None:
+        await ctx.response.send_message("You haven’t sent any messages yet!")
+    else:
+        await ctx.response.send_message(f"You have sent {count} messages")
 
 
-@bot.tree.command(name="streak", description="check your focus streaks")
+@bot.tree.command(name="streak")
 async def streak(ctx: discord.Interaction):
-	if ctx.user.id not in streak_counter:
-		await ctx.response.send_message("To start a streak start and finish a focus timer for 10 minutes or more.")
-		return
-	await ctx.response.send_message(f"Your daily focus streak is {streak_counter[ctx.user.id]['value']} 🔥")
+    if ctx.user.id not in streak_counter:
+        await ctx.response.send_message("No active streak. start a focus timer to build your streak!")
+    else:
+        await ctx.response.send_message(
+            f"Your focus streak is {streak_counter[ctx.user.id]['value']} 🔥"
+        )
 
 
 async def streak_checker():
@@ -432,12 +459,6 @@ async def streak_checker():
 					user = await bot.fetch_user(user_id)
 					await user.send(random.choice(reminders))
 					streak_counter[user_id]["reminded"] = day_now
-
-					# Update DB with new reminded value
-					async with db_pool.acquire() as conn:
-						await conn.execute("""
-							UPDATE streaks SET reminded=$2 WHERE user_id=$1
-						""", user_id, day_now)
 	
 		await asyncio.sleep(60*60)
 
