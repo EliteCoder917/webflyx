@@ -7,14 +7,64 @@ from datetime import date
 import random
 import os
 from dotenv import load_dotenv
-import os
 import re
+import asyncpg
+import signal
+import time
+import sys
 
 timers_active_focus = {}
 timers_active_break = {}
 streak_counter = {}
 message_counter = {}
 
+load_dotenv()
+API_KEY = os.getenv('API_KEY')
+DATABASE_URL = os.getenv('DATABASE_URL')
+
+db_pool = None
+
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
+
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS streaks (
+                user_id BIGINT PRIMARY KEY,
+                day INT,
+                month INT,
+                year INT,
+                value INT,
+                reminded INT
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                user_id BIGINT PRIMARY KEY,
+                count INT
+            )
+        """)
+
+async def load_user_data():
+    global streak_counter, message_counter
+    async with db_pool.acquire() as conn:
+
+        rows = await conn.fetch("SELECT * FROM streaks")
+        for row in rows:
+            streak_counter[row['user_id']] = {
+                "day": row['day'],
+                "month": row['month'],
+                "year": row['year'],
+                "value": row['value'],
+                "reminded": row['reminded']
+            }
+
+        
+        rows = await conn.fetch("SELECT * FROM messages")
+        for row in rows:
+            message_counter[row['user_id']] = row['count']
 
 test_guild = discord.Object(id=1468297881130897510)
 
@@ -28,6 +78,68 @@ class BotCreate(commands.Bot):
 
 bot = BotCreate()
 
+async def save_all_data():
+    async with db_pool.acquire() as conn:
+        # Save messages
+        for user_id, count in message_counter.items():
+            await conn.execute("""
+                INSERT INTO messages(user_id, count)
+                VALUES($1,$2)
+                ON CONFLICT(user_id) DO UPDATE
+                SET count=$2
+            """, user_id, count)
+        
+        # Save streaks
+        for user_id, data in streak_counter.items():
+            await conn.execute("""
+                INSERT INTO streaks(user_id, day, month, year, value, reminded)
+                VALUES($1,$2,$3,$4,$5,$6)
+                ON CONFLICT(user_id) DO UPDATE
+                SET day=$2, month=$3, year=$4, value=$5, reminded=$6
+            """, user_id, data['day'], data['month'], data['year'], data['value'], data['reminded'])
+
+
+async def periodic_save():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            await save_all_data()
+        except Exception as e:
+            print(f"Error saving data periodically: {e}")
+        await asyncio.sleep(60)
+
+def shutdown_handler():
+    print("Bot shutting down…")
+
+    async def shutdown():
+        print("Cancelling timers...")
+        for task in timers_active_focus.values():
+            task.cancel()
+        for task in timers_active_break.values():
+            task.cancel()
+
+        print("Saving data...")
+        await save_all_data()
+
+        print("Closing database pool...")
+        await db_pool.close()
+
+        print("Closing bot...")
+        await bot.close()
+
+    loop = bot.loop
+
+    if loop.is_running():
+        fut = asyncio.run_coroutine_threadsafe(shutdown(), loop)
+        try:
+            fut.result(timeout=30)
+        except Exception as e:
+            print("Shutdown error:", e)
+    else:
+        asyncio.run(save_all_data())
+
+    print("Shutdown complete.")
+    sys.exit(0)
 
 @bot.event
 async def on_member_join(member: discord.Member):
@@ -53,13 +165,17 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def on_ready():
+	global db_pool
 	print(f"logged in as {bot.user}")
+	await init_db()
+	await load_user_data()
 	try:
 		synced = await bot.tree.sync()
 		print(f"Synced {len(synced)} commands")
 	except Exception as e:
 		print(f"Failed to sync commands: {e}")
 	bot.loop.create_task(streak_checker())
+	bot.loop.create_task(periodic_save())
 
 
 @bot.event
@@ -73,10 +189,8 @@ async def on_message(message):
 
 	await bot.process_commands(message)
 
-	if user_id not in message_counter:
-		message_counter[user_id] = 1
-	else:
-		message_counter[user_id] += 1
+	message_counter[user_id] = message_counter.get(user_id, 0) + 1
+
 
 
 @bot.tree.command(name="ping", description="check bot is working")
@@ -96,6 +210,14 @@ async def chat(ctx: discord.Interaction, *, message: str):
     await ctx.response.defer()
     process = None
 
+
+    prompt = (
+        f"You are FlowBot, a friendly and helpful Discord AI. "
+        f"Always refer to yourself as FlowBot. Respond to the user in a clear and concise way.\n\n"
+        f"User: {message}\nFlowBot:"
+    )
+
+
     try:
         process = await asyncio.create_subprocess_exec(
             "ollama", "run", "mistral",
@@ -106,7 +228,7 @@ async def chat(ctx: discord.Interaction, *, message: str):
         )
 
         stdout, stderr = await asyncio.wait_for(
-            process.communicate(message.encode()),
+            process.communicate(prompt.encode()),
             timeout=60
         )
 
@@ -172,6 +294,20 @@ async def focus_timer(ctx: discord.Interaction, minutes: int):
 				streak_counter[user_id]["value"] += 1
 				streak_counter[user_id]["reminded"] = day
 				await ctx.followup.send("You have added to you current streak!")
+			
+			streak_counter[user_id]["day"] = today_date.day
+			streak_counter[user_id]["month"] = today_date.month
+			streak_counter[user_id]["year"] = today_date.year
+			streak_counter[user_id]["reminded"] = today_date.day
+
+		data = streak_counter[user_id]
+		async with db_pool.acquire() as conn:
+			await conn.execute("""
+        	INSERT INTO streaks(user_id, day, month, year, value, reminded)
+        	VALUES($1,$2,$3,$4,$5,$6)
+        	ON CONFLICT(user_id) DO UPDATE
+        	SET day=$2, month=$3, year=$4, value=$5, reminded=$6
+    	""", user_id, data['day'], data['month'], data['year'], data['value'], data['reminded'])
 
 	timers_active_focus.pop(user_id, None)
 
@@ -296,9 +432,14 @@ async def streak_checker():
 					user = await bot.fetch_user(user_id)
 					await user.send(random.choice(reminders))
 					streak_counter[user_id]["reminded"] = day_now
+
+					# Update DB with new reminded value
+					async with db_pool.acquire() as conn:
+						await conn.execute("""
+							UPDATE streaks SET reminded=$2 WHERE user_id=$1
+						""", user_id, day_now)
 	
 		await asyncio.sleep(60*60)
-
 
 
 @bot.tree.command(name="quote", description="get a short motivational message")
@@ -316,14 +457,9 @@ async def quote(ctx: discord.Interaction):
 		   ]
 	await ctx.response.send_message(random.choice(quotes))
 
-
-load_dotenv()
-API_KEY = os.getenv('API_KEY')
+signal.signal(signal.SIGINT, lambda s,f: shutdown_handler())
+signal.signal(signal.SIGTERM, lambda s,f: shutdown_handler())
 
 bot.run(API_KEY)
-
-
-
-
 
 
